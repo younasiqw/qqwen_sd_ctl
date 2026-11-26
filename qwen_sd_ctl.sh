@@ -353,10 +353,12 @@ APP_DIR = Path(os.environ.get("APP_DIR", str(Path(__file__).resolve().parent)))
 SD_CLI = APP_DIR / "bin" / "sd-cli"
 MODELS_QWEN = APP_DIR / "models" / "qwen21"
 MODELS_SD = APP_DIR / "models" / "sd"
+if not MODELS_SD.exists() and (APP_DIR / "models" / "sd15").exists():
+    MODELS_SD = APP_DIR / "models" / "sd15"
 UPLOADS_DIR = APP_DIR / "uploads"
 OUTPUTS_DIR = APP_DIR / "outputs"
 
-AUTH_ENABLED = os.environ.get("AUTH_ENABLED", "1") == "1"
+AUTH_ENABLED = os.environ.get("AUTH_ENABLED", "0") == "1"
 AUTH_USER = os.environ.get("AUTH_USER", "admin")
 AUTH_PASS = os.environ.get("AUTH_PASS", "")
 DEFAULT_THREADS = int(os.environ.get("DEFAULT_THREADS", str(os.cpu_count() or 4)))
@@ -429,6 +431,7 @@ queue_cond = threading.Condition()
 pending_queue = deque()
 current_job = None
 last_finished = {
+    "job_id": "",
     "status": "idle",
     "output_url": "",
     "error": "",
@@ -539,17 +542,33 @@ def cleanup_old_uploads():
             pass
 
 
-def parse_progress(line: str, job: dict):
-    m = re.search(r"(?:\||step\s*)(\d+)\s*/\s*(\d+)", line, re.IGNORECASE)
+def parse_progress(line: str, job: dict) -> bool:
+    low = line.lower()
+    m = re.search(r"(?:\|\s*|step\s+)(\d+)\s*/\s*(\d+)", line, re.IGNORECASE)
     if m:
         cur, total = int(m.group(1)), int(m.group(2))
         if 0 <= cur <= total and total > 0:
-            job["progress"] = min(99, int(cur * 100 / total))
-            job["step_text"] = f"采样步数 {cur}/{total}"
-            return
-    if "decoding latents" in line.lower() or ("vae" in line.lower() and "decode" in line.lower()):
+            pct = max(5, min(95, int(cur * 90 / total) + 5))
+            sp_m = re.search(r"(\d+(?:\.\d+)?\s*(?:s/it|it/s))", line)
+            sp = f" · {sp_m.group(1)}" if sp_m else ""
+            job["progress"] = pct
+            job["step_text"] = f"采样步数 {cur}/{total}{sp}"
+            return True
+    if "loading" in low and ("model" in low or "tensors" in low or "llm" in low or "vae" in low):
+        if job["progress"] < 10:
+            job["progress"] = 8
+            job["step_text"] = "加载模型权重中..."
+    elif "conditioning" in low or "get_learned_condition" in low or "encode" in low:
+        if job["progress"] < 18:
+            job["progress"] = 15
+            job["step_text"] = "编码提示词与参考图..."
+    elif "sampling" in low and job["progress"] < 20:
+        job["progress"] = 20
+        job["step_text"] = "扩散采样中..."
+    elif "decoding latents" in low or ("vae" in low and "decode" in low):
         job["progress"] = 96
         job["step_text"] = "VAE 解码出图中..."
+    return False
 
 
 def worker_loop():
@@ -562,6 +581,8 @@ def worker_loop():
             current_job = job
             job["status"] = "running"
             job["started_at"] = time.time()
+            job["progress"] = 5
+            job["step_text"] = "启动推理进程..."
 
         cleanup_old_uploads()
         out_path: Path = job["output_path"]
@@ -582,10 +603,13 @@ def worker_loop():
                 clean = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", line).strip()
                 if not clean:
                     continue
-                parse_progress(clean, job)
-                job["logs"].append(clean)
-                if len(job["logs"]) > 250:
-                    job["logs"] = job["logs"][-250:]
+                is_bar = parse_progress(clean, job)
+                if is_bar and job["logs"] and "|" in job["logs"][-1] and "/" in job["logs"][-1]:
+                    job["logs"][-1] = clean
+                else:
+                    job["logs"].append(clean)
+                    if len(job["logs"]) > 250:
+                        job["logs"] = job["logs"][-250:]
 
             ret = proc.wait()
             elapsed = int(time.time() - job["started_at"])
@@ -604,6 +628,7 @@ def worker_loop():
                     json.dumps(job["meta"], ensure_ascii=False, indent=2), encoding="utf-8"
                 )
                 last_finished.update({
+                    "job_id": job["id"],
                     "status": "done",
                     "output_url": f"/outputs/{out_path.name}",
                     "error": "",
@@ -614,6 +639,7 @@ def worker_loop():
                 })
             elif job["status"] == "cancelled":
                 last_finished.update({
+                    "job_id": job["id"],
                     "status": "cancelled",
                     "output_url": last_finished.get("output_url", ""),
                     "error": "任务已被手动中止",
@@ -624,11 +650,12 @@ def worker_loop():
                 })
             else:
                 hint = ""
-                if ret == -9 or ret == 137:
+                if ret in (-9, 137):
                     hint = "（检测到 OOM 被系统查杀，请开启 mmap、降低分辨率或增大 Swap）"
-                elif ret == -4 or ret == 132:
+                elif ret in (-4, 132):
                     hint = "（检测到 CPU 指令集不兼容 SIGILL，请在脚本菜单执行 [6] 切换 Portable 兼容编译）"
                 last_finished.update({
+                    "job_id": job["id"],
                     "status": "error",
                     "output_url": last_finished.get("output_url", ""),
                     "error": f"推理进程异常退出 (exit={ret}) {hint}",
@@ -639,6 +666,7 @@ def worker_loop():
                 })
         except Exception as e:
             last_finished.update({
+                "job_id": job["id"],
                 "status": "error",
                 "error": str(e),
                 "logs": job["logs"][-80:],
@@ -691,7 +719,7 @@ def api_status():
         else:
             data = {
                 "running": False,
-                "job_id": "",
+                "job_id": last_finished.get("job_id", ""),
                 "status": last_finished["status"],
                 "engine": "",
                 "prompt": "",
@@ -955,7 +983,7 @@ async def api_generate(
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return """<!DOCTYPE html>
+    return r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8" />
@@ -968,7 +996,7 @@ def index():
   .wrap { max-width: 1280px; margin: 0 auto; padding: 16px; }
   header { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:14px; border-bottom:1px solid var(--border); padding-bottom:12px; }
   header h1 { margin:0; font-size:1.22rem; color:var(--accent); }
-  .stats { display:flex; gap:8px; flex-wrap:wrap; }
+  .stats { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
   .badge { font-size:0.76rem; padding:4px 10px; border-radius:999px; background:var(--card); border:1px solid var(--border); color:var(--muted); }
   .grid { display:grid; grid-template-columns: 445px 1fr; gap:16px; }
   @media (max-width: 960px) { .grid { grid-template-columns: 1fr; } }
@@ -1007,21 +1035,81 @@ def index():
   .g-cap { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-bottom:6px; color:var(--text); }
   .g-ops { display:flex; gap:5px; justify-content:space-between; }
   .err { color:#fca5a5; font-size:0.84rem; margin-top:8px; }
+
+  /* 右上角网页内进度豆腐块（非弹窗、不遮挡页面、可关闭） */
+  .prog-tile {
+    position: fixed;
+    top: 14px;
+    right: 14px;
+    width: 286px;
+    max-width: calc(100vw - 28px);
+    z-index: 9999;
+    background: rgba(21, 30, 50, 0.96);
+    backdrop-filter: blur(8px);
+    border: 1px solid var(--accent);
+    border-radius: 12px;
+    padding: 11px 13px;
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+    display: none;
+  }
+  .prog-tile.done { border-color: var(--ok); }
+  .prog-tile.error { border-color: var(--danger); }
+  .pt-head { display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:6px; }
+  .pt-title-wrap { display:flex; align-items:center; gap:7px; font-size:0.85rem; }
+  .pt-dot { width:8px; height:8px; border-radius:50%; background:var(--accent); flex-shrink:0; }
+  .pt-dot.running { animation: ptPulse 1.2s infinite; }
+  .pt-dot.done { background:var(--ok); }
+  .pt-dot.error { background:var(--danger); }
+  .pt-dot.cancelled { background:var(--muted); }
+  @keyframes ptPulse { 0%,100% { opacity:1; transform:scale(1); } 50% { opacity:0.35; transform:scale(0.8); } }
+  .pt-close { background:transparent; border:none; color:var(--muted); cursor:pointer; font-size:1.15rem; line-height:1; padding:0 4px; border-radius:4px; }
+  .pt-close:hover { color:#fff; background:rgba(255,255,255,0.08); }
+  .pt-meta { display:flex; justify-content:space-between; align-items:center; font-size:0.76rem; color:var(--muted); margin-bottom:5px; gap:6px; }
+  .pt-step { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .pt-pct { font-weight:700; color:var(--text); flex-shrink:0; }
+  .pt-bar-wrap { width:100%; height:6px; background:var(--panel); border-radius:99px; overflow:hidden; border:1px solid var(--border); }
+  .pt-bar { height:100%; width:0%; background:linear-gradient(90deg, #38bdf8, #22c55e); transition:width 0.3s; }
+  .pt-foot { display:flex; justify-content:space-between; align-items:center; margin-top:7px; font-size:0.73rem; color:var(--muted); gap:6px; }
+  .pt-prompt { margin-top:5px; font-size:0.72rem; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .pt-stop { padding:2px 8px; font-size:0.72rem; border-radius:5px; background:rgba(239,68,68,0.18); color:#fca5a5; border:1px solid rgba(239,68,68,0.45); cursor:pointer; }
+  .pt-stop:hover { background:var(--danger); color:#fff; }
 </style>
 </head>
 <body>
+
+<div id="progressTile" class="prog-tile" role="status" aria-live="polite">
+  <div class="pt-head">
+    <div class="pt-title-wrap">
+      <span id="ptDot" class="pt-dot running"></span>
+      <strong id="ptTitle">生成进度</strong>
+    </div>
+    <button type="button" class="pt-close" onclick="closeProgressTile()" title="关闭进度显示" aria-label="关闭">×</button>
+  </div>
+  <div class="pt-meta">
+    <span id="ptStep" class="pt-step">准备中...</span>
+    <span id="ptPct" class="pt-pct">0%</span>
+  </div>
+  <div class="pt-bar-wrap"><div id="ptBar" class="pt-bar"></div></div>
+  <div id="ptPrompt" class="pt-prompt"></div>
+  <div class="pt-foot">
+    <span id="ptSub">已耗时 0s</span>
+    <button type="button" id="ptStopBtn" class="pt-stop" style="display:none" onclick="cancelJob()">中止</button>
+  </div>
+</div>
+
 <div class="wrap">
   <header>
     <h1>⚡ 全平台本地无限制生图 / 改图工坊</h1>
     <div class="stats">
       <span class="badge" id="modelBadge">读取模型...</span>
       <span class="badge" id="sysBadge">ARCH | RAM | Swap | Load</span>
+      <button type="button" id="reopenTileBtn" class="btn-sm" style="display:none" onclick="reopenProgressTile()">显示进度块</button>
     </div>
   </header>
 
   <div class="grid">
     <div class="card">
-      <form id="genForm">
+      <form id="genForm" method="post" action="javascript:void(0)">
         <label>推理引擎</label>
         <select id="engine" name="engine" onchange="onEngineChange()">
           <option value="qwen21">Qwen-Image-2.1-Turbo (千问无限制 · 中文/精准改图)</option>
@@ -1158,6 +1246,11 @@ let currentShownFilename = '';
 let galleryCache = [];
 let refNaturalW = 0, refNaturalH = 0;
 
+// 右上角进度豆腐块状态
+let tileClosedByUser = false;
+let lastSeenJobId = '';
+let lastStatusSnapshot = null;
+
 function esc(s) {
   return String(s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
@@ -1170,6 +1263,113 @@ function align32(v, minV, maxV) {
 function setSize(w, h) {
   document.getElementById('width').value = w;
   document.getElementById('height').value = h;
+}
+
+function closeProgressTile() {
+  tileClosedByUser = true;
+  document.getElementById('progressTile').style.display = 'none';
+  if (lastStatusSnapshot && (lastStatusSnapshot.running || lastStatusSnapshot.status !== 'idle')) {
+    document.getElementById('reopenTileBtn').style.display = 'inline-block';
+  }
+}
+
+function reopenProgressTile() {
+  tileClosedByUser = false;
+  document.getElementById('reopenTileBtn').style.display = 'none';
+  if (lastStatusSnapshot) updateProgressTile(lastStatusSnapshot);
+}
+
+function showSubmittedTile(promptText) {
+  tileClosedByUser = false;
+  document.getElementById('reopenTileBtn').style.display = 'none';
+  const tile = document.getElementById('progressTile');
+  tile.className = 'prog-tile';
+  tile.style.display = 'block';
+  document.getElementById('ptDot').className = 'pt-dot running';
+  document.getElementById('ptTitle').textContent = '已提交队列';
+  document.getElementById('ptStep').textContent = '准备启动推理...';
+  document.getElementById('ptPct').textContent = '2%';
+  document.getElementById('ptBar').style.width = '2%';
+  document.getElementById('ptPrompt').textContent = promptText || '';
+  document.getElementById('ptSub').textContent = '已耗时 0s';
+  document.getElementById('ptStopBtn').style.display = 'none';
+}
+
+function updateProgressTile(st) {
+  lastStatusSnapshot = st;
+  const tile = document.getElementById('progressTile');
+  const reopenBtn = document.getElementById('reopenTileBtn');
+
+  if (st.running && st.job_id && st.job_id !== lastSeenJobId) {
+    lastSeenJobId = st.job_id;
+    tileClosedByUser = false;
+  }
+
+  if (!st.running && st.status === 'idle') {
+    tile.style.display = 'none';
+    reopenBtn.style.display = 'none';
+    return;
+  }
+
+  if (tileClosedByUser) {
+    tile.style.display = 'none';
+    reopenBtn.style.display = 'inline-block';
+    return;
+  }
+
+  reopenBtn.style.display = 'none';
+  tile.style.display = 'block';
+
+  const dot = document.getElementById('ptDot');
+  const title = document.getElementById('ptTitle');
+  const step = document.getElementById('ptStep');
+  const pctEl = document.getElementById('ptPct');
+  const bar = document.getElementById('ptBar');
+  const promptEl = document.getElementById('ptPrompt');
+  const sub = document.getElementById('ptSub');
+  const stopBtn = document.getElementById('ptStopBtn');
+
+  const qCount = (st.queue && st.queue.length) ? st.queue.length : 0;
+  const pct = Math.max(0, Math.min(100, st.progress || 0));
+
+  if (st.running) {
+    tile.className = 'prog-tile';
+    dot.className = 'pt-dot running';
+    title.textContent = `生成中 (${st.engine || ''})`;
+    step.textContent = st.step_text || '加载权重中...';
+    pctEl.textContent = pct + '%';
+    bar.style.width = pct + '%';
+    promptEl.textContent = st.prompt || '';
+    sub.textContent = `已耗时 ${st.elapsed_sec || 0}s` + (qCount ? ` · 排队 ${qCount}` : '');
+    stopBtn.style.display = 'inline-block';
+  } else if (st.status === 'done') {
+    tile.className = 'prog-tile done';
+    dot.className = 'pt-dot done';
+    title.textContent = '生成完成';
+    step.textContent = st.step_text || '已完成';
+    pctEl.textContent = '100%';
+    bar.style.width = '100%';
+    sub.textContent = `总耗时 ${st.elapsed_sec || 0}s`;
+    stopBtn.style.display = 'none';
+  } else if (st.status === 'error') {
+    tile.className = 'prog-tile error';
+    dot.className = 'pt-dot error';
+    title.textContent = '生成失败';
+    step.textContent = st.error || '发生错误';
+    pctEl.textContent = 'ERR';
+    bar.style.width = '0%';
+    sub.textContent = `耗时 ${st.elapsed_sec || 0}s`;
+    stopBtn.style.display = 'none';
+  } else if (st.status === 'cancelled') {
+    tile.className = 'prog-tile';
+    dot.className = 'pt-dot cancelled';
+    title.textContent = '任务已中止';
+    step.textContent = '已手动停止';
+    pctEl.textContent = '0%';
+    bar.style.width = '0%';
+    sub.textContent = `耗时 ${st.elapsed_sec || 0}s`;
+    stopBtn.style.display = 'none';
+  }
 }
 
 function updateSizePlan() {
@@ -1207,20 +1407,28 @@ function updateSizePlan() {
 }
 
 async function init() {
-  const res = await fetch('/api/models');
-  modelInfo = await res.json();
-  const qOk = modelInfo.qwen.ready_t2i;
-  const sOk = modelInfo.sd.ready;
-  document.getElementById('modelBadge').textContent = `Qwen2.1: ${qOk ? '已就绪' : '未下载'} | SD: ${sOk ? '已就绪' : '未下载'}`;
-  document.getElementById('threads').value = modelInfo.sys.default_threads || 4;
-  document.getElementById('threads').max = modelInfo.sys.logical_cores || 16;
-  document.getElementById('use_mmap').checked = !!modelInfo.sys.default_mmap;
-  document.getElementById('max_edge').value = String(modelInfo.sys.default_max_edge || 768);
-  if (!qOk && sOk) document.getElementById('engine').value = 'sd';
-  onEngineChange();
+  // 自动清理残留的 GET 查询参数
+  if (window.location.search) {
+    window.history.replaceState({}, document.title, window.location.pathname);
+  }
+  try {
+    const res = await fetch('/api/models');
+    modelInfo = await res.json();
+    const qOk = modelInfo.qwen.ready_t2i;
+    const sOk = modelInfo.sd.ready;
+    document.getElementById('modelBadge').textContent = `Qwen2.1: ${qOk ? '已就绪' : '未下载'} | SD: ${sOk ? '已就绪' : '未下载'}`;
+    document.getElementById('threads').value = modelInfo.sys.default_threads || 4;
+    document.getElementById('threads').max = modelInfo.sys.logical_cores || 16;
+    document.getElementById('use_mmap').checked = !!modelInfo.sys.default_mmap;
+    document.getElementById('max_edge').value = String(modelInfo.sys.default_max_edge || 768);
+    if (!qOk && sOk) document.getElementById('engine').value = 'sd';
+    onEngineChange();
+  } catch (err) {
+    document.getElementById('errMsg').textContent = '初始化模型信息失败: ' + err;
+  }
   loadGallery();
   pollStatus();
-  setInterval(pollStatus, 2500);
+  setInterval(pollStatus, 2000);
 }
 
 function onEngineChange() {
@@ -1296,11 +1504,20 @@ function clearUpload() {
 document.getElementById('genForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   document.getElementById('errMsg').textContent = '';
+  const promptVal = document.getElementById('prompt').value.trim();
+  if (!promptVal) {
+    document.getElementById('errMsg').textContent = '请输入提示词';
+    return;
+  }
   const fd = new FormData(e.target);
   if (!document.getElementById('use_mmap').checked) fd.set('use_mmap', '0');
   if (!document.getElementById('use_fa').checked) fd.set('use_fa', '0');
   if (!document.getElementById('vae_tiling').checked) fd.set('vae_tiling', '0');
   if (!(refNaturalW > 0 && refNaturalH > 0)) fd.set('size_mode', 'manual');
+
+  const btn = document.getElementById('submitBtn');
+  btn.disabled = true;
+  btn.textContent = '提交中...';
   try {
     const res = await fetch('/api/generate', { method: 'POST', body: fd });
     const data = await res.json();
@@ -1308,9 +1525,13 @@ document.getElementById('genForm').addEventListener('submit', async (e) => {
       document.getElementById('errMsg').textContent = data.detail || '提交失败';
       return;
     }
+    showSubmittedTile(promptVal);
     pollStatus();
   } catch (err) {
     document.getElementById('errMsg').textContent = '请求失败: ' + err;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '加入队列 / 开始生成';
   }
 });
 
@@ -1327,6 +1548,7 @@ async function removeQueued(id) {
 async function pollStatus() {
   try {
     const res = await fetch('/api/status');
+    if (!res.ok) return;
     const st = await res.json();
     if (st.sys) {
       const s = st.sys;
@@ -1355,6 +1577,8 @@ async function pollStatus() {
       } else if (st.status === 'cancelled') title.textContent = '⏹ 任务已中止';
       else title.textContent = '等待任务';
     }
+
+    updateProgressTile(st);
 
     if (st.output_url && st.output_url !== lastOutputUrl) {
       lastOutputUrl = st.output_url;
@@ -1415,26 +1639,29 @@ async function deleteImg(filename) {
 }
 
 async function loadGallery() {
-  const res = await fetch('/api/gallery');
-  const data = await res.json();
-  galleryCache = data.items || [];
-  const g = document.getElementById('gallery');
-  g.innerHTML = galleryCache.map((item, idx) => {
-    const m = item.meta || {};
-    const info = `${m.engine || ''} ${m.width || ''}×${m.height || ''} ${m.elapsed_sec ? m.elapsed_sec + 's' : ''}`;
-    return `<div class="g-item">
-      <img src="${esc(item.url)}" loading="lazy" onclick="showResult('${esc(item.url)}')" />
-      <div class="g-meta">
-        <div class="g-cap" title="${esc(m.prompt || item.filename)}">${esc(m.prompt || item.filename)}</div>
-        <div style="margin-bottom:6px;font-size:0.7rem">${esc(info)}</div>
-        <div class="g-ops">
-          <button class="btn-sm" onclick="setGalleryAsRef('${esc(item.filename)}','${esc(item.url)}')">作参考图</button>
-          <button class="btn-sm" onclick="reuseMeta(${idx})">复用</button>
-          <button class="btn-sm" style="color:#fca5a5" onclick="deleteImg('${esc(item.filename)}')">删</button>
+  try {
+    const res = await fetch('/api/gallery');
+    if (!res.ok) return;
+    const data = await res.json();
+    galleryCache = data.items || [];
+    const g = document.getElementById('gallery');
+    g.innerHTML = galleryCache.map((item, idx) => {
+      const m = item.meta || {};
+      const info = `${m.engine || ''} ${m.width || ''}×${m.height || ''} ${m.elapsed_sec ? m.elapsed_sec + 's' : ''}`;
+      return `<div class="g-item">
+        <img src="${esc(item.url)}" loading="lazy" onclick="showResult('${esc(item.url)}')" />
+        <div class="g-meta">
+          <div class="g-cap" title="${esc(m.prompt || item.filename)}">${esc(m.prompt || item.filename)}</div>
+          <div style="margin-bottom:6px;font-size:0.7rem">${esc(info)}</div>
+          <div class="g-ops">
+            <button class="btn-sm" onclick="setGalleryAsRef('${esc(item.filename)}','${esc(item.url)}')">作参考图</button>
+            <button class="btn-sm" onclick="reuseMeta(${idx})">复用</button>
+            <button class="btn-sm" style="color:#fca5a5" onclick="deleteImg('${esc(item.filename)}')">删</button>
+          </div>
         </div>
-      </div>
-    </div>`;
-  }).join('');
+      </div>`;
+    }).join('');
+  } catch (_) {}
 }
 
 init();
