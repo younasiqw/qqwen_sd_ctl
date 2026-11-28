@@ -334,6 +334,8 @@ import glob
 import uuid
 import json
 import time
+import hmac
+import hashlib
 import base64
 import platform
 import secrets
@@ -346,7 +348,7 @@ from typing import Optional
 
 from PIL import Image, ImageOps
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 APP_DIR = Path(os.environ.get("APP_DIR", str(Path(__file__).resolve().parent)))
@@ -382,27 +384,151 @@ QWEN_TURBO_SIGMAS = "1.0,0.978453,0.954180,0.926626,0.895080,0.845148,0.704534,0
 
 app = FastAPI(title="Universal Qwen / SD Studio")
 
+AUTH_COOKIE_NAME = "qwen_sd_session"
+AUTH_SESSION_TTL = 7 * 86400
+
+
+def _auth_required() -> bool:
+    return bool(AUTH_ENABLED and AUTH_PASS)
+
+
+def _session_secret() -> bytes:
+    return hashlib.sha256(f"qwen-sd-session:{AUTH_USER}:{AUTH_PASS}".encode("utf-8")).digest()
+
+
+def create_session_token(username: str) -> str:
+    exp = int(time.time()) + AUTH_SESSION_TTL
+    payload = f"{username}:{exp}"
+    sig = hmac.new(_session_secret(), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{payload}:{sig}".encode("utf-8")).decode("ascii")
+
+
+def verify_session_token(token: str) -> bool:
+    if not token:
+        return False
+    try:
+        raw = base64.urlsafe_b64decode(token.encode("ascii")).decode("utf-8")
+        username, exp_str, sig = raw.rsplit(":", 2)
+        if not secrets.compare_digest(username, AUTH_USER):
+            return False
+        if int(exp_str) < int(time.time()):
+            return False
+        expected = hmac.new(_session_secret(), f"{username}:{exp_str}".encode("utf-8"), hashlib.sha256).hexdigest()
+        return secrets.compare_digest(sig, expected)
+    except Exception:
+        return False
+
 
 @app.middleware("http")
-async def basic_auth_middleware(request: Request, call_next):
-    if AUTH_ENABLED and AUTH_PASS:
-        auth = request.headers.get("Authorization", "")
-        valid = False
-        if auth.startswith("Basic "):
-            try:
-                decoded = base64.b64decode(auth[6:]).decode("utf-8")
-                user, pwd = decoded.split(":", 1)
-                if secrets.compare_digest(user, AUTH_USER) and secrets.compare_digest(pwd, AUTH_PASS):
-                    valid = True
-            except Exception:
-                valid = False
-        if not valid:
-            return Response(
-                content="Authentication Required",
-                status_code=401,
-                headers={"WWW-Authenticate": 'Basic realm="Universal Qwen-SD Studio"'},
-            )
+async def session_auth_middleware(request: Request, call_next):
+    if _auth_required():
+        path = request.url.path
+        if path in ("/login", "/api/login", "/api/logout"):
+            return await call_next(request)
+        token = request.cookies.get(AUTH_COOKIE_NAME, "")
+        if not verify_session_token(token):
+            if path.startswith("/api/"):
+                return JSONResponse({"detail": "请先登录"}, status_code=401)
+            accept = request.headers.get("accept", "")
+            if path == "/" or "text/html" in accept:
+                return RedirectResponse(url="/login", status_code=302)
+            return Response(content="Authentication Required", status_code=401)
     return await call_next(request)
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_page(request: Request):
+    if not _auth_required() or verify_session_token(request.cookies.get(AUTH_COOKIE_NAME, "")):
+        return RedirectResponse(url="/", status_code=302)
+    return r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>登录 - 全平台本地无限制生图 / 改图工坊</title>
+<style>
+  :root { --bg:#0b1120; --card:#151e32; --panel:#0f172a; --border:#293548; --text:#e2e8f0; --muted:#94a3b8; --accent:#38bdf8; --danger:#ef4444; }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; padding:16px; font-family: system-ui, -apple-system, sans-serif; background:var(--bg); color:var(--text); }
+  .login-card { width:100%; max-width:380px; background:var(--card); border:1px solid var(--border); border-radius:14px; padding:26px 24px; box-shadow:0 14px 36px rgba(0,0,0,0.45); }
+  h1 { margin:0 0 6px; font-size:1.18rem; color:var(--accent); text-align:center; }
+  .sub { margin:0 0 20px; font-size:0.82rem; color:var(--muted); text-align:center; }
+  label { display:block; font-size:0.82rem; color:var(--muted); margin:12px 0 5px; }
+  input { width:100%; background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:8px; padding:10px 12px; font-size:0.92rem; outline:none; }
+  input:focus { border-color:var(--accent); }
+  .btn { cursor:pointer; border:none; border-radius:8px; padding:11px 14px; font-weight:600; font-size:0.94rem; width:100%; margin-top:18px; background:var(--accent); color:#0b1120; }
+  .btn:disabled { opacity:0.65; cursor:not-allowed; }
+  .err { color:#fca5a5; font-size:0.83rem; margin-top:12px; min-height:1.1em; text-align:center; }
+</style>
+</head>
+<body>
+<div class="login-card">
+  <h1>⚡ 全平台本地无限制生图 / 改图工坊</h1>
+  <p class="sub">请输入账号密码以进入控制台</p>
+  <form id="loginForm" method="post" action="javascript:void(0)">
+    <label for="username">用户名</label>
+    <input type="text" id="username" name="username" autocomplete="username" required autofocus />
+    <label for="password">密码</label>
+    <input type="password" id="password" name="password" autocomplete="current-password" required />
+    <button type="submit" class="btn" id="loginBtn">登录</button>
+    <div class="err" id="errMsg"></div>
+  </form>
+</div>
+<script>
+document.getElementById('loginForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const errEl = document.getElementById('errMsg');
+  const btn = document.getElementById('loginBtn');
+  errEl.textContent = '';
+  btn.disabled = true;
+  btn.textContent = '登录中...';
+  try {
+    const fd = new FormData(e.target);
+    const res = await fetch('/api/login', { method: 'POST', body: fd });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      errEl.textContent = data.detail || '用户名或密码错误';
+      return;
+    }
+    window.location.href = '/';
+  } catch (err) {
+    errEl.textContent = '登录请求失败: ' + err;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '登录';
+  }
+});
+</script>
+</body>
+</html>"""
+
+
+@app.post("/api/login")
+async def api_login(request: Request, username: str = Form(...), password: str = Form(...)):
+    if not _auth_required():
+        return JSONResponse({"ok": True})
+    if not (secrets.compare_digest(username, AUTH_USER) and secrets.compare_digest(password, AUTH_PASS)):
+        return JSONResponse({"detail": "用户名或密码错误"}, status_code=401)
+    token = create_session_token(username)
+    is_https = request.url.scheme == "https" or request.headers.get("x-forwarded-proto", "").lower() == "https"
+    resp = JSONResponse({"ok": True})
+    resp.set_cookie(
+        key=AUTH_COOKIE_NAME,
+        value=token,
+        max_age=AUTH_SESSION_TTL,
+        httponly=True,
+        samesite="lax",
+        secure=is_https,
+        path="/",
+    )
+    return resp
+
+
+@app.post("/api/logout")
+def api_logout():
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(key=AUTH_COOKIE_NAME, path="/")
+    return resp
 
 
 app.mount("/outputs", StaticFiles(directory=str(OUTPUTS_DIR)), name="outputs")
@@ -487,6 +613,7 @@ def get_sys_stats():
         "default_threads": DEFAULT_THREADS,
         "default_mmap": DEFAULT_MMAP,
         "default_max_edge": DEFAULT_MAX_EDGE,
+        "auth_enabled": _auth_required(),
         "cli_caps": sorted(list(get_cli_caps())),
     }
 
@@ -1058,7 +1185,7 @@ def index():
 <title>全平台本地无限制生图 / 改图工坊</title>
 <style>
   :root { --bg:#0b1120; --card:#151e32; --panel:#0f172a; --border:#293548; --text:#e2e8f0; --muted:#94a3b8; --accent:#38bdf8; --ok:#22c55e; --danger:#ef4444; }
-  * { box-sizing: border-box; }
+- { box-sizing: border-box; }
   body { margin:0; font-family: system-ui, -apple-system, sans-serif; background:var(--bg); color:var(--text); }
   .wrap { max-width: 1280px; margin: 0 auto; padding: 16px; }
   header { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:14px; border-bottom:1px solid var(--border); padding-bottom:12px; }
@@ -1171,6 +1298,7 @@ def index():
       <span class="badge" id="modelBadge">读取模型...</span>
       <span class="badge" id="sysBadge">ARCH | RAM | Swap | Load</span>
       <button type="button" id="reopenTileBtn" class="btn-sm" style="display:none" onclick="reopenProgressTile()">显示进度块</button>
+      <button type="button" id="logoutBtn" class="btn-sm" style="display:none" onclick="logout()">退出登录</button>
     </div>
   </header>
 
@@ -1324,6 +1452,11 @@ let lastStatusSnapshot = null;
 
 function esc(s) {
   return String(s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function logout() {
+  await fetch('/api/logout', { method: 'POST' });
+  window.location.href = '/login';
 }
 
 function align32(v, minV, maxV) {
@@ -1492,6 +1625,7 @@ async function init() {
   }
   try {
     const res = await fetch('/api/models');
+    if (res.status === 401) { window.location.href = '/login'; return; }
     modelInfo = await res.json();
     const qOk = modelInfo.qwen.ready_t2i;
     const sOk = modelInfo.sd.ready;
@@ -1500,6 +1634,9 @@ async function init() {
     document.getElementById('threads').max = modelInfo.sys.logical_cores || 16;
     document.getElementById('use_mmap').checked = !!modelInfo.sys.default_mmap;
     document.getElementById('max_edge').value = String(modelInfo.sys.default_max_edge || 768);
+    if (modelInfo.sys && modelInfo.sys.auth_enabled) {
+      document.getElementById('logoutBtn').style.display = 'inline-block';
+    }
     if (modelInfo.loras && modelInfo.loras.length) {
       document.getElementById('loraWrap').style.display = 'block';
       document.getElementById('loraChips').innerHTML = modelInfo.loras
@@ -1605,6 +1742,7 @@ document.getElementById('genForm').addEventListener('submit', async (e) => {
   btn.textContent = '提交中...';
   try {
     const res = await fetch('/api/generate', { method: 'POST', body: fd });
+    if (res.status === 401) { window.location.href = '/login'; return; }
     const data = await res.json();
     if (!res.ok) {
       document.getElementById('errMsg').textContent = data.detail || '提交失败';
@@ -1621,18 +1759,21 @@ document.getElementById('genForm').addEventListener('submit', async (e) => {
 });
 
 async function cancelJob() {
-  await fetch('/api/cancel', { method: 'POST' });
+  const res = await fetch('/api/cancel', { method: 'POST' });
+  if (res.status === 401) { window.location.href = '/login'; return; }
   pollStatus();
 }
 
 async function removeQueued(id) {
-  await fetch('/api/queue/' + encodeURIComponent(id), { method: 'DELETE' });
+  const res = await fetch('/api/queue/' + encodeURIComponent(id), { method: 'DELETE' });
+  if (res.status === 401) { window.location.href = '/login'; return; }
   pollStatus();
 }
 
 async function pollStatus() {
   try {
     const res = await fetch('/api/status');
+    if (res.status === 401) { window.location.href = '/login'; return; }
     if (!res.ok) return;
     const st = await res.json();
     if (st.sys) {
@@ -1719,13 +1860,15 @@ function reuseMeta(idx) {
 
 async function deleteImg(filename) {
   if (!confirm('确认删除图片 ' + filename + ' ?')) return;
-  await fetch('/api/gallery/' + encodeURIComponent(filename), { method: 'DELETE' });
+  const res = await fetch('/api/gallery/' + encodeURIComponent(filename), { method: 'DELETE' });
+  if (res.status === 401) { window.location.href = '/login'; return; }
   loadGallery();
 }
 
 async function loadGallery() {
   try {
     const res = await fetch('/api/gallery');
+    if (res.status === 401) { window.location.href = '/login'; return; }
     if (!res.ok) return;
     const data = await res.json();
     galleryCache = data.items || [];
